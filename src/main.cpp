@@ -8,6 +8,7 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
@@ -172,7 +173,7 @@ int main() {
   // Waypoint map to read from
   string map_file_ = "../data/highway_map.csv";
   // The max s value before wrapping around the track back to 0
-  double max_s = 6945.554;
+  double max_s = 6972.38;
 
   ifstream in_map_(map_file_.c_str(), ifstream::in);
 
@@ -196,7 +197,13 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  // vehicle target lane and velocity (MPH)
+  int prev_lane = 1;
+  int lane = 1;
+  double ref_vel = 3.5;
+  double target_vel = 49.1;
+
+  h.onMessage([&target_vel,&max_s,&prev_lane,&lane,&ref_vel,&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -239,7 +246,251 @@ int main() {
           	vector<double> next_y_vals;
 
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
+            // TODO: define a path made up of (x,y) points that the car will visit sequentially every 0.02 seconds
+            int prev_size = previous_path_x.size();
+
+            if (prev_size > 0) {
+              car_s = end_path_s;
+            }
+
+            bool too_close = false;
+            bool too_close_prev = false;
+            bool left_available = true;
+            bool right_available = true;
+            bool middle_available = true;
+
+            double max_fwd_distances[3] = {100, 100, 100};
+            double max_rev_distances[3] = {-100, -100, -100};
+
+            // determine lane occupancy
+            for (int i=0; i<sensor_fusion.size(); i++) {
+              // other car occupies our lane, left adjacent lane, or right lane
+              float d = sensor_fusion[i][6];
+              if ((d < (2+4*(0)+3.00) && d > (2+4*(0)-3.00)) ||
+                  (d < (2+4*(1)+3.00) && d > (2+4*(1)-3.00)) ||
+                  (d < (2+4*(2)+3.00) && d > (2+4*(2)-3.00))) {
+                double vx = sensor_fusion[i][3];
+                double vy = sensor_fusion[i][4];
+                double check_speed = sqrt(vx*vx+vy*vy);
+                double check_car_s = sensor_fusion[i][5];
+                check_car_s += ((double) prev_size * 0.02 * check_speed);
+
+
+                // handle end of track wrapping
+                double distance = check_car_s - car_s;
+                if (distance > 0.5 * max_s) {
+                  check_car_s -= max_s;
+                } else if (distance < -0.5 * max_s) {
+                  check_car_s += max_s;
+                }
+                distance = check_car_s - car_s;
+
+                // determine optimal lane (consider only positive distances)
+                if (distance > 0)
+                {
+                  if (d < (2+4*(0)+3.00) && d > (2+4*(0)-3.00)) {
+                    if (distance < max_fwd_distances[2])
+                      max_fwd_distances[2] = distance;
+                  } else if (d < (2+4*(1)+3.00) && d > (2+4*(1)-3.00)) {
+                    if (distance < max_fwd_distances[1])
+                      max_fwd_distances[1] = distance;
+                  } else if (d < (2+4*(2)+3.00) && d > (2+4*(2)-3.00)) {
+                    if (distance < max_fwd_distances[0])
+                      max_fwd_distances[0] = distance;
+                  }
+                }
+
+                if (distance <= 0) {
+                  if (d < (2+4*(0)+3.00) && d > (2+4*(0)-3.00)) {
+                    if (distance > max_rev_distances[2])
+                      max_rev_distances[2] = distance;
+                  } else if (d < (2+4*(1)+3.00) && d > (2+4*(1)-3.00)) {
+                    if (distance > max_rev_distances[1])
+                      max_rev_distances[1] = distance;
+                  } else if (d < (2+4*(2)+3.00) && d > (2+4*(2)-3.00)) {
+                    if (distance > max_rev_distances[0])
+                      max_rev_distances[0] = distance;
+                  }
+                }
+
+                // car ahead is too close
+                if (((d < (2+4*lane+3.00) && d > (2+4*lane-3.00)) &&
+                    (distance > 0) && (distance < ref_vel * 0.9))) {
+                  too_close = true;
+                  if (lane == 0)
+                    left_available = false;
+                  else if (lane == 1)
+                    middle_available = false;
+                  else if (lane == 2)
+                    right_available = false;
+                }
+
+                // car in previous lane is too close
+                if (((d < (2+4*prev_lane+3.00) && d > (2+4*prev_lane-3.00)) &&
+                    (distance > 5) && (distance < ref_vel * 0.9))) {
+                  too_close_prev = true;
+                }
+
+                // left lane is occupied
+                if (((d < (2+4*(0)+3.00) && d > (2+4*(0)-3.00)) &&
+                    (distance > -ref_vel * 0.5) && (distance < ref_vel * 0.9)) && (lane != 0)) {
+                  left_available = false;
+                }
+
+                // middle lane is occupied
+                if (((d < (2+4*(1)+3.00) && d > (2+4*(1)-3.00)) &&
+                    (distance > -ref_vel * 0.5) && (distance < ref_vel * 0.9)) && (lane != 1)) {
+                  middle_available = false;
+                }
+
+                // right lane is occupied
+                if (((d < (2+4*(2)+3.00) && d > (2+4*(2)-3.00)) &&
+                   (distance > -ref_vel * 0.5) && (distance < ref_vel * 0.9)) && (lane != 2)) {
+                  right_available = false;
+                }
+              }
+            }
+
+            // best lane selector
+            double *maximum = std::max_element(max_fwd_distances, max_fwd_distances+3);
+            double best_lane = 2 - std::distance(max_fwd_distances, maximum);
+
+            std::cout << std::fixed << std::setprecision(2);
+            std::cout << "Distances [FWD]: " << setw(10) << right << max_fwd_distances[2] << " " << (max_fwd_distances[2] > ref_vel * 0.9 ? "OK" : "  ")
+                                             << setw(10) << right << max_fwd_distances[1] << " " << (max_fwd_distances[1] > ref_vel * 0.9 ? "OK" : "  ")
+                                             << setw(10) << right << max_fwd_distances[0] << " " << (max_fwd_distances[0] > ref_vel * 0.9 ? "OK" : "  ")
+                                             << "    Limit: "
+                                             << setw(10) << right << ref_vel * 0.9 << std::endl;
+            std::cout << "Distances [REV]: " << setw(10) << right << max_rev_distances[2] << " " << (max_rev_distances[2] < -ref_vel * 0.5 ? "OK" : "  ")
+                                             << setw(10) << right << max_rev_distances[1] << " " << (max_rev_distances[1] < -ref_vel * 0.5 ? "OK" : "  ")
+                                             << setw(10) << right << max_rev_distances[0] << " " << (max_rev_distances[0] < -ref_vel * 0.5 ? "OK" : "  ")
+                                             << "    Limit: "
+                                             << setw(10) << right << -ref_vel * 0.5 << std::endl;
+            std::cout << "Occupancy [LMR]: " << setw(10) << (left_available ? "AVAILABLE" : "OCCUPIED")   << " "
+                                             << (lane == 0 ? "^" : " ") << (best_lane == 0 ? "*" : " ")
+                                             << setw(10) << (middle_available ? "AVAILABLE" : "OCCUPIED") << " "
+                                             << (lane == 1 ? "^" : " ") << (best_lane == 1 ? "*" : " ")
+                                             << setw(10) << (right_available ? "AVAILABLE" : "OCCUPIED")  << " "
+                                             << (lane == 2 ? "^" : " ") << (best_lane == 2 ? "*" : " ") << "    "
+                                             << setw(10) << (ref_vel <= 30 ? "LOW VELOCITY LOCKOUT" : "") << std::endl;
+
+            // only change lanes with speed > 30 MPH and adjacent lane is safe to occupy)
+            if ((ref_vel > 30) && (car_d < (2+4*(lane)+2.00) && car_d > (2+4*(lane)-2.00))) {
+              prev_lane = lane;
+              if (best_lane != lane) {
+                if (lane < best_lane) {
+                  lane += 1;
+                } else {
+                  lane -= 1;
+                }
+
+                // reject lane change if obstruction exists
+                if ((prev_lane == 1) && (lane == 0) && !left_available) {
+                  lane += 1;
+                } else if ((prev_lane == 1) && (lane == 2) && !right_available) {
+                  lane -= 1;
+                } else if ((prev_lane == 0) && (lane == 1) && (!middle_available || !right_available)) {
+                  lane -= 1;
+                } else if ((prev_lane == 2) && (lane == 1) && (!middle_available || !left_available)) {
+                  lane += 1;
+                }
+
+              }
+            }
+
+            // change speed to account for obstacles ahead
+            if (too_close) {
+              ref_vel = ref_vel * 0.984;
+            } else if (too_close_prev) {
+              ref_vel -= 0.05;
+            } else if (ref_vel < 30) {
+              ref_vel += 0.8;
+            } else if (ref_vel < target_vel) {
+              ref_vel = ref_vel * 1.016;
+            }
+
+            // generate trajectory
+            vector<double> ptsx, ptsy;
+            double ref_x = car_x;
+            double ref_y = car_y;
+            double ref_yaw = deg2rad(car_yaw);
+
+            if(prev_size < 2) {
+              double prev_car_x = car_x - cos(car_yaw);
+              double prev_car_y = car_y - sin(car_yaw);
+
+              ptsx.push_back(prev_car_x);
+              ptsx.push_back(car_x);
+
+              ptsy.push_back(prev_car_y);
+              ptsy.push_back(car_y);
+            } else {
+              ref_x = previous_path_x[prev_size-1];
+              ref_y = previous_path_y[prev_size-1];
+
+              double ref_x_prev = previous_path_x[prev_size-2];
+              double ref_y_prev = previous_path_y[prev_size-2];
+              ref_yaw = atan2(ref_y-ref_y_prev, ref_x-ref_x_prev);
+
+              ptsx.push_back(ref_x_prev);
+              ptsx.push_back(ref_x);
+
+              ptsy.push_back(ref_y_prev);
+              ptsy.push_back(ref_y);
+            }
+
+            vector<double> next_wp0 = getXY(car_s+40, (2+4*lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp1 = getXY(car_s+80, (2+4*lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_wp2 = getXY(car_s+120, (2+4*lane), map_waypoints_s, map_waypoints_x, map_waypoints_y);
+
+            ptsx.push_back(next_wp0[0]); ptsy.push_back(next_wp0[1]);
+            ptsx.push_back(next_wp1[0]); ptsy.push_back(next_wp1[1]);
+            ptsx.push_back(next_wp2[0]); ptsy.push_back(next_wp2[1]);
+
+            for (int i=0; i < ptsx.size(); i++) {
+              double shift_x = ptsx[i] - ref_x;
+              double shift_y = ptsy[i] - ref_y;
+
+              ptsx[i] = (shift_x * cos(0-ref_yaw) - shift_y * sin(0-ref_yaw));
+              ptsy[i] = (shift_x * sin(0-ref_yaw) + shift_y * cos(0-ref_yaw));
+            }
+
+            tk::spline s;
+
+            s.set_points(ptsx, ptsy);
+
+            for (int i=0; i < previous_path_x.size(); i++) {
+              next_x_vals.push_back(previous_path_x[i]);
+              next_y_vals.push_back(previous_path_y[i]);
+            }
+
+            double target_x = 20.0;
+            double target_y = s(target_x);
+            double target_dist = sqrt((target_x*target_x)+(target_y*target_y));
+
+            double x_add_on = 0;
+
+            for (int i=1; i <= 100-previous_path_x.size(); i++) {
+              double N = (target_dist/(0.02*ref_vel/2.24));
+              double x_point = x_add_on+(target_x)/N;
+              double y_point = s(x_point);
+
+              x_add_on = x_point;
+
+              double x_ref = x_point;
+              double y_ref = y_point;
+
+              // rotate back
+              x_point = (x_ref * cos(ref_yaw) - y_ref * sin(ref_yaw));
+              y_point = (x_ref * sin(ref_yaw) + y_ref * cos(ref_yaw));
+
+              x_point += ref_x;
+              y_point += ref_y;
+
+              next_x_vals.push_back(x_point);
+              next_y_vals.push_back(y_point);
+            }
+
           	msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
