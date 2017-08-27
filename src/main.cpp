@@ -259,8 +259,8 @@ int main() {
             bool right_available = true;
             bool middle_available = true;
 
-            double max_fwd_distances[3] = {100, 100, 100};
-            double max_rev_distances[3] = {-100, -100, -100};
+            double max_fwd_distances[3] = {200, 200, 200};
+            double max_rev_distances[3] = {-200, -200, -200};
 
             // determine lane occupancy
             for (int i=0; i<sensor_fusion.size(); i++) {
